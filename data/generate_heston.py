@@ -4,21 +4,39 @@ Generates synthetic heston iv surfaces
 
 import argparse
 import os
+from typing import Any, Sequence
 import numpy as np
+from numpy.typing import NDArray
 import h5py
 import yaml
 import QuantLib as ql
 from py_vollib_vectorized import vectorized_implied_volatility
 
 
-def is_arbitrage_free(iv, taus, atol=1e-4):
+def is_arbitrage_free(iv: NDArray[np.floating], taus: NDArray[np.floating],
+                      atol: float = 1e-4) -> bool:
+    '''
+    Check that the IV surface has no arbitrage
+    Conceptually, checking if total variance does not decrease.
+    An option with a longer time to maturity should have higher variance.
+    '''
+    # Reject if NaNs are present
     if np.any(~np.isfinite(iv)) or np.any(iv <= 0):
         return False
+    # Convert implied volatility to total variance
+    # Also flatten to 1 axis using the second term
     w = (iv ** 2) * taus[None, :]
+    # Checking across every lement of w, that variance does no decrease
     return np.all(np.diff(w, axis=1) >= -atol)
 
 
-def prices_to_iv(prices, s0, r, q, strikes, taus, flags):
+def prices_to_iv(prices: NDArray[np.floating], s0: float, r: float, q: float,
+                 strikes: Sequence[float], taus: Sequence[float],
+                 flags: Sequence[str]) -> NDArray[np.floating]:
+    '''
+    Convert prices to implied volatility
+    - Uses a Black-Scholes inversion
+    '''
     n_k, n_tau = prices.shape
     K_grid, T_grid = np.meshgrid(strikes, taus, indexing="ij")
     flag_grid = np.broadcast_to(np.asarray(flags)[:, None], (n_k, n_tau))
@@ -30,29 +48,44 @@ def prices_to_iv(prices, s0, r, q, strikes, taus, flags):
     return iv.reshape(n_k, n_tau)
 
 
-def heston_option_prices(s0, r, q, kappa, theta, xi, rho, v0,
-                         strikes, taus, flags):
+def heston_option_prices(s0: float, r: float, q: float,
+                         kappa: float, theta: float, xi: float,
+                         rho: float, v0: float,
+                         strikes: Sequence[float], taus: Sequence[float],
+                         flags: Sequence[str]) -> NDArray[np.float64]:
     """Price European options on a (K, tau) grid. flags: 'c' or 'p' per strike."""
     today = ql.Date(1, 1, 2025)
     ql.Settings.instance().evaluationDate = today
     day_count = ql.Actual365Fixed()
 
     spot = ql.QuoteHandle(ql.SimpleQuote(s0))
+    # Yield structure risk free rate and divident yield respectively
     rTS = ql.YieldTermStructureHandle(ql.FlatForward(today, r, day_count))
     qTS = ql.YieldTermStructureHandle(ql.FlatForward(today, q, day_count))
+
     process = ql.HestonProcess(rTS, qTS, spot, v0, kappa, theta, xi, rho)
     model = ql.HestonModel(process)
     engine = ql.AnalyticHestonEngine(model)
 
     prices = np.zeros((len(strikes), len(taus)), dtype=np.float64)
     for j, tau in enumerate(taus):
+
+        # Converts the maturity float tau into a date
         maturity = today + int(round(tau * 365))
+
+        # When one can earn 
         exercise = ql.EuropeanExercise(maturity)
         for i, K in enumerate(strikes):
             opt_type = ql.Option.Call if flags[i] == "c" else ql.Option.Put
+
+            # What one can jarn
             payoff = ql.PlainVanillaPayoff(opt_type, float(K))
+
+            # In the 3D array, the option object lives
             option = ql.VanillaOption(payoff, exercise)
             option.setPricingEngine(engine)
+
+            # Gracefully handle engine failures, populate with NaN
             try:
                 prices[i, j] = option.NPV()
             except RuntimeError:
@@ -60,7 +93,10 @@ def heston_option_prices(s0, r, q, kappa, theta, xi, rho, v0,
     return prices
 
 
-def sample_params(cfg, rng):
+def sample_params(cfg: dict[str, Any], rng: np.random.Generator) -> NDArray[np.float64]:
+    '''
+    Create random values for each parameter
+    '''
     h = cfg["heston"]
     return np.array([
         rng.uniform(*h["kappa"]),
@@ -71,14 +107,14 @@ def sample_params(cfg, rng):
     ])
 
 
-def build_grid(cfg):
+def build_grid(cfg: dict[str, Any]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     g = cfg["grid"]
     k = np.linspace(g["k_min"], g["k_max"], g["n_k"])
     tau = np.geomspace(g["tau_min"], g["tau_max"], g["n_tau"])
     return k, tau
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--n_samples", type=int, default=None)
