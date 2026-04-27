@@ -62,28 +62,28 @@ def main():
     train_errors = train_predictions - y_train
     test_errors = test_predictions - y_test
 
-    # Calculates Root Mean Squared error for each parameter
+    # Calculates Root Mean Squared Error for each parameter
     train_rmse = np.sqrt(np.mean(train_errors**2, axis=0))
     test_rmse = np.sqrt(np.mean(test_errors**2, axis=0))
+
+    # Calculates normalized RMSE for each parameter to compare to pytorch
+    parameter_std = np.std(y_test, axis=0)
+    normalized_rmse = test_rmse / parameter_std
 
     # Prints RMSE results
     parameter_names = ["base_vol", "strike_curve", "maturity_slope"]
 
     print("\nTrain RMSE by parameter:")
     for name, error in zip(parameter_names, train_rmse):
-        print(f"{name}: {error:.8f}")
+        print(f"{name}: {error:.10f}")
 
     print("\nTest RMSE by parameter:")
     for name, error in zip(parameter_names, test_rmse):
-        print(f"{name}: {error:.8f}")
+        print(f"{name}: {error:.10f}")
 
-    print(f"\nSanity Check")
-    print("X_train:", X_train.shape)
-    print("X_test:", X_test.shape)
-    print("flat_X_train:", flat_X_train.shape)
-    print("weights:", weights.shape)
-    print("test_predictions:", test_predictions.shape)
-    print("test RMSE:", test_rmse)
+    print("\nNormalized Test RMSE by parameter:")
+    for name, error in zip(parameter_names, normalized_rmse):
+        print(f"{name}: {error:.10f}")
 
 if __name__ == "__main__":
     main()
