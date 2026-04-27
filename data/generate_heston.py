@@ -1,123 +1,159 @@
+"""
+Generates synthetic heston iv surfaces
+"""
+
+import argparse
+import os
 import numpy as np
-import matplotlib.pyplot as plt
+import h5py
+import yaml
+import QuantLib as ql
+from py_vollib_vectorized import vectorized_implied_volatility
 
-# Random seed for debugging
-np.random.seed(0)
 
-# Defines surface size for strikes by maturities
-n_strikes = 16 # number of strike price grid points
-n_maturities = 20 # number of time to expire grid points
+def is_arbitrage_free(iv, taus, atol=1e-4):
+    if np.any(~np.isfinite(iv)) or np.any(iv <= 0):
+        return False
+    w = (iv ** 2) * taus[None, :]
+    return np.all(np.diff(w, axis=1) >= -atol)
 
-# Makes evenly spaced grid points for strikes and maturities
-# log(moneyness) used instead of direct strike price; moneyness = stock price/ strike prices
-log_moneyness_grid = np.linspace(-0.3, 0.3, n_strikes)
-maturity_grid = np.linspace(0.1, 2.0, n_maturities)
 
-def generate_surface(parameters):
-    # Unpacks fake surface parameters
-    base_vol = parameters[0]
-    strike_curve = parameters[1]
-    maturity_slope = parameters[2]
-
-    # Creates empty volatility surface
-    surface = np.zeros((n_strikes, n_maturities))
-
-    # Next creates a simple fake volatility pattern toy formula
-    # NOT REAL HESTON!
-
-    # Loop through every strike row and maturity column in the surface
-    # i/ j are array positions [i, j]
-    for i, log_moneyness in enumerate(log_moneyness_grid):
-        for j, maturity in enumerate(maturity_grid):
-            # Strike effect creates example parabolic shape of curve (2nd order)
-            strike_effect = strike_curve * log_moneyness**2
-            # Maturity effect tilts surface as maturity (time) increases
-            maturity_effect = maturity_slope * maturity
-
-            implied_vol = base_vol + strike_effect + maturity_effect
-
-            surface[i, j] = implied_vol
-
-    return surface
-
-def sample_parameters():
-    # Randomly sample one fake parameter vector
-    base_vol = np.random.uniform(0.15, 0.3)
-    strike_curve = np.random.uniform(0.1, 0.6)
-    maturity_slope = np.random.uniform(0.00, 0.05)
-
-    return np.array([base_vol, strike_curve, maturity_slope])
-
-def generate_dataset(n_example):
-    # Stores generated surfaces and matching parameters
-    parameter_list = []
-    surface_list = []
-
-    # Generates one matched pair of surfaces and parameters at a time
-    for _ in range(n_example):
-        params = sample_parameters()
-        surface = generate_surface(params)
-
-        parameter_list.append(params)
-        surface_list.append(surface)
-
-    # Converts lists into NumPy arrays 
-    surfaces = np.stack(surface_list)
-    parameters = np.stack(parameter_list)
-    
-    # Returns matched surface/ parameters arrays
-    return surfaces, parameters
-
-def plot_surface(surfaces, parameters, example_index):
-    # Selects a particular surface and its matching parameters
-    surface = surfaces[example_index]
-    params = parameters[example_index]
-
-    # Converts 1D strikes/ maturity grids into full 2D coordinate grids
-    # Gives matplotlib an (x, y) for every volatility (z) value
-    maturity_mesh, log_moneyness_mesh = np.meshgrid(
-        maturity_grid,
-        log_moneyness_grid
+def prices_to_iv(prices, s0, r, q, strikes, taus, flags):
+    n_k, n_tau = prices.shape
+    K_grid, T_grid = np.meshgrid(strikes, taus, indexing="ij")
+    flag_grid = np.broadcast_to(np.asarray(flags)[:, None], (n_k, n_tau))
+    iv = vectorized_implied_volatility(
+        prices.flatten(), s0, K_grid.flatten(), T_grid.flatten(), r,
+        flag_grid.flatten(),
+        q=q, model="black_scholes_merton", return_as="numpy",
     )
+    return iv.reshape(n_k, n_tau)
 
-    # Creates a 3D plot for surface
-    fig = plt.figure(figsize=(8,6))
-    ax = fig.add_subplot(111, projection="3d")
 
-    ax.plot_surface(
-        log_moneyness_mesh,
-        maturity_mesh,
-        surface,
-        cmap="viridis"
-    )
+def heston_option_prices(s0, r, q, kappa, theta, xi, rho, v0,
+                         strikes, taus, flags):
+    """Price European options on a (K, tau) grid. flags: 'c' or 'p' per strike."""
+    today = ql.Date(1, 1, 2025)
+    ql.Settings.instance().evaluationDate = today
+    day_count = ql.Actual365Fixed()
 
-    # Labels for 3D plot
-    ax.set_xlabel("Log moneyness")
-    ax.set_ylabel("Maturity")
-    ax.set_zlabel("Implied volatility")
+    spot = ql.QuoteHandle(ql.SimpleQuote(s0))
+    rTS = ql.YieldTermStructureHandle(ql.FlatForward(today, r, day_count))
+    qTS = ql.YieldTermStructureHandle(ql.FlatForward(today, q, day_count))
+    process = ql.HestonProcess(rTS, qTS, spot, v0, kappa, theta, xi, rho)
+    model = ql.HestonModel(process)
+    engine = ql.AnalyticHestonEngine(model)
 
-    ax.set_title(
-        f"Example {example_index}: "
-        f"base_vol={params[0]:.3f}, "
-        f"strike_curve={params[1]:.3f}, "
-        f"maturity_slope={params[2]:.3f}"
-    )
-    plt.show()
+    prices = np.zeros((len(strikes), len(taus)), dtype=np.float64)
+    for j, tau in enumerate(taus):
+        maturity = today + int(round(tau * 365))
+        exercise = ql.EuropeanExercise(maturity)
+        for i, K in enumerate(strikes):
+            opt_type = ql.Option.Call if flags[i] == "c" else ql.Option.Put
+            payoff = ql.PlainVanillaPayoff(opt_type, float(K))
+            option = ql.VanillaOption(payoff, exercise)
+            option.setPricingEngine(engine)
+            try:
+                prices[i, j] = option.NPV()
+            except RuntimeError:
+                prices[i, j] = np.nan
+    return prices
+
+
+def sample_params(cfg, rng):
+    h = cfg["heston"]
+    return np.array([
+        rng.uniform(*h["kappa"]),
+        rng.uniform(*h["theta"]),
+        rng.uniform(*h["xi"]),
+        rng.uniform(*h["rho"]),
+        rng.uniform(*h["v0"]),
+    ])
+
+
+def build_grid(cfg):
+    g = cfg["grid"]
+    k = np.linspace(g["k_min"], g["k_max"], g["n_k"])
+    tau = np.geomspace(g["tau_min"], g["tau_max"], g["n_tau"])
+    return k, tau
+
 
 def main():
-    # Generates toy dataset size n
-    n_dataset = 1000
-    surfaces, parameters = generate_dataset(n_dataset)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/default.yaml")
+    ap.add_argument("--n_samples", type=int, default=None)
+    ap.add_argument("--output", default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    args = ap.parse_args()
 
-    # Saves the dataset (surface/parameters) and grid to \outputs
-    np.save("outputs/fake_surfaces.npy", surfaces)
-    np.save("outputs/fake_parameters.npy", parameters)
-    np.save("outputs/log_moneyness_grid.npy", log_moneyness_grid)
-    np.save("outputs/maturity_grid.npy", maturity_grid)
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
-    print("Generated surfaces:", surfaces.shape)
-    print("Generated parameters:", parameters.shape)
-    print("Surface 0 equals surface 1:", np.allclose(surfaces[0], surfaces[1]))
+    n = args.n_samples or cfg["data"]["n_samples"]
+    out = args.output or cfg["data"]["path"]
+    seed = args.seed if args.seed is not None else cfg["data"]["seed"]
+    rng = np.random.default_rng(seed)
+
+    s0 = cfg["heston"]["s0"]
+    r = cfg["heston"]["r"]
+    q = cfg["heston"]["q"]
+
+    k_grid, tau_grid = build_grid(cfg)
+    flags = np.where(k_grid >= 0, "c", "p")  # OTM: call for k>=0, put for k<0
+
+    surfaces = np.zeros((n, len(k_grid), len(tau_grid)), dtype=np.float32)
+    params = np.zeros((n, 5), dtype=np.float32)
+
+    accepted = 0
+    attempts = 0
+    while accepted < n:
+        attempts += 1
+        p = sample_params(cfg, rng)
+        kappa, theta, xi, rho, v0 = p
+
+        iv_surface = np.full((len(k_grid), len(tau_grid)), np.nan)
+        ok = True
+
+        for j, tau in enumerate(tau_grid):
+            F = s0 * np.exp((r - q) * tau)
+            strikes = F * np.exp(k_grid)
+            prices = heston_option_prices(s0, r, q, kappa, theta, xi, rho, v0,
+                                          strikes, [tau], flags)[:, 0]
+
+            if np.any(~np.isfinite(prices)):
+                ok = False
+                break
+            # Floor underflow / signed-zero noise; deep OTM truly has price < fp64 precision.
+            prices = np.maximum(prices, 1e-12)
+
+            iv_col = prices_to_iv(prices[:, None], s0, r, q, strikes, [tau], flags)[:, 0]
+            if np.any(~np.isfinite(iv_col)) or np.any(iv_col <= 0):
+                ok = False
+                break
+            iv_surface[:, j] = iv_col
+
+        if not ok or not is_arbitrage_free(iv_surface, tau_grid):
+            continue
+
+        surfaces[accepted] = iv_surface.astype(np.float32)
+        params[accepted] = p.astype(np.float32)
+        accepted += 1
+        if accepted % 50 == 0:
+            print(f" accepted {accepted}/{n} rejection rate {1 - accepted/attempts:.2%}")
+
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with h5py.File(out, "w") as f:
+        f.create_dataset("surfaces", data=surfaces)
+        f.create_dataset("parameters", data=params)
+        f.create_dataset("grid_k", data=k_grid.astype(np.float32))
+        f.create_dataset("grid_tau", data=tau_grid.astype(np.float32))
+        f.attrs["param_names"] = ["kappa", "theta", "xi", "rho", "v0"]
+        f.attrs["s0"] = s0
+        f.attrs["r"] = r
+        f.attrs["q"] = q
+    print(f"wrote {n} surfaces to {out} ({attempts} attempts, "
+          f"{1 - n/attempts:.2%} rejected)")
+
 
 if __name__ == "__main__":
     main()
