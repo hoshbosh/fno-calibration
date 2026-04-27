@@ -1,0 +1,54 @@
+data:
+  path: data/heston_smoke.h5
+  n_samples: 1000
+  train_frac: 0.8
+  val_frac: 0.1
+  seed: 42
+
+heston: 
+  kappa: [0.5, 5.0]
+  theta: [0.02, 0.15]
+  xi: [0.1, 1.0]
+  rho: [-0.95, -0.3]
+  v0: [0.01, 0.12]
+  s0: 1.0
+  r: 0.02
+  q: 0.0
+
+grid:
+  n_k: 16
+  k_min: -0.5
+  k_max: 0.5
+  n_tau: 20
+  tau_min: 0.02
+  tau_max: 2.0
+
+fno:
+  in_channel: 1
+  hidden_channels: 64
+  modes1: 12
+  modes2: 12
+  n_blocks: 4
+  proj_channels: 128
+  pool_size: [4, 5]
+  head_hidden: [256, 64]
+  out_dim: 5
+
+mlp:
+  in_dim: 320
+  hidden: [512, 256, 128]
+  out_dim: 5
+
+train:
+  batch_size: 64
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_workers: 2
+
+wandb:
+  project: fno-calibration
+  entity: null
+
+checkpoint_dir: checkpoints
+
