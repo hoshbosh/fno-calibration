@@ -1,5 +1,5 @@
 data:
-  path: data/heston_smoke.h5
+  path: data/smoke-test.h5
   n_samples: 1000
   train_frac: 0.8
   val_frac: 0.1

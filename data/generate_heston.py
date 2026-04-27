@@ -19,6 +19,7 @@ def is_arbitrage_free(iv: NDArray[np.floating], taus: NDArray[np.floating],
     Check that the IV surface has no arbitrage
     Conceptually, checking if total variance does not decrease.
     An option with a longer time to maturity should have higher variance.
+    This is redundance since the Heston Process should not allow this to happen
     '''
     # Reject if NaNs are present
     if np.any(~np.isfinite(iv)) or np.any(iv <= 0):
@@ -142,6 +143,8 @@ def main() -> None:
 
     accepted = 0
     attempts = 0
+
+    # Generate a surface, if it is invalid via NaNs or arbitrage, reject the surface
     while accepted < n:
         attempts += 1
         p = sample_params(cfg, rng)
@@ -177,6 +180,7 @@ def main() -> None:
         if accepted % 50 == 0:
             print(f" accepted {accepted}/{n} rejection rate {1 - accepted/attempts:.2%}")
 
+    # Write to hdf5 file
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with h5py.File(out, "w") as f:
         f.create_dataset("surfaces", data=surfaces)
