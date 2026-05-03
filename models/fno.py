@@ -45,6 +45,14 @@ class SpectralConv2d(nn.Module):
 
         return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
 
+class FourerBlock(nn.Module):
+    def __init__(self, channels: int, modes1: int, modes2: int):
+        super().__init__()
+        self.spectral_conv = SpectralConv2d(channels, channels, modes1, modes2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.spectral_conv(x)
+
 class FNO2d(nn.Module):
     def __init__(
             self, 
