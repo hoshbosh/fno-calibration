@@ -45,7 +45,7 @@ class SpectralConv2d(nn.Module):
 
         return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
 
-class FourerBlock(nn.Module):
+class FourierBlock(nn.Module):
     def __init__(self, channels: int, modes1: int, modes2: int):
         super().__init__()
         self.spectral_conv = SpectralConv2d(channels, channels, modes1, modes2)
@@ -71,9 +71,17 @@ class FNO2d(nn.Module):
         # Lifting layer, convolutional transformation into 64 channels
         self.lifting = nn.Conv2d(in_channel, hidden_channels, kernel_size=1)
 
+        layer_modes = [(12, 8), (10, 7), (8, 6), (6, 5)][:n_blocks]
+        self.fourier_layers = nn.ModuleList([
+            FourierBlock(hidden_channels, m1, m2) for m1, m2 in layer_modes
+        ])
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
     # Shape of x is [batch, in_channel, n_k, n_tau]
         x = self.lifting(x) #[batch, in_channel, n_k, n_tau] -> [batch, hidden_channels, n_k, n_tau]
+
+        for layer in self.fourier_layers:
+            x = layer(x)
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
