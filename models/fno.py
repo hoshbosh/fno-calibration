@@ -17,10 +17,14 @@ class FNO2d(nn.Module):
             out_dim: int,
     ) -> None:
         super().__init__()
+        
+        # Lifting layer, convolutional transformation into 64 channels
+        self.lifting = nn.Conv2d(in_channel, hidden_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
     # Shape of x is [batch, in_channel, n_k, n_tau]
-        raise NotImplementedError
+        x = self.lifting(x) #[batch, in_channel, n_k, n_tau] -> [batch, hidden_channels, n_k, n_tau]
+        return x
     
 def build_fno(cfg : dict) -> FNO2d:
     f= cfg["fno"]
