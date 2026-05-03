@@ -37,9 +37,9 @@ class SpectralConv2d(nn.Module):
         )
 
         if x.size(-2) > m1:
-            out_ft[:, :, :m1, :m2] = torch.einsum(
+            out_ft[:, :, -m1:, :m2] = torch.einsum(
                 "bixy, ioxy -> boxy",
-                x_ft[:, :, :m1, :m2],
+                x_ft[:, :, -m1:, :m2],
                 self.weights2[:, :, :m1, :m2],
             )
 
