@@ -79,10 +79,15 @@ class FNO2d(nn.Module):
         
         # Lifting layer, convolutional transformation into 64 channels
         self.lifting = nn.Conv2d(in_channel, hidden_channels, kernel_size=1)
+        self.fourier_blocks = nn.ModuleList([
+            FourierBlock(hidden_channels, modes1, modes2) for _ in range(n_blocks)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
     # Shape of x is [batch, in_channel, n_k, n_tau]
         x = self.lifting(x) #[batch, in_channel, n_k, n_tau] -> [batch, hidden_channels, n_k, n_tau]
+        for block in self.fourier_blocks:
+            x = block(x)
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
