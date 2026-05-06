@@ -131,16 +131,12 @@ class FNO2d(nn.Module):
 
         x = self.lifting(x)              # -> (batch, hidden_channels, n_k, n_tau)
         for block in self.fourier_blocks:
-<<<<<<< jlabasbas/fno-input-refactor
             x = block(x)                 # shape preserved
-=======
-            x = block(x)
         x = self.projection(x)
         x_pooled = self.pool(x).flatten(1)
         x = self.head(x_pooled)
         # aux = self.aux_head(x_pooled) # Optional auxilary head
         
->>>>>>> master
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
