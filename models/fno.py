@@ -82,12 +82,44 @@ class FNO2d(nn.Module):
         self.fourier_blocks = nn.ModuleList([
             FourierBlock(hidden_channels, modes1, modes2) for _ in range(n_blocks)
         ])
+        # Expands channels 64->128, applies GELU nonlinearity, then compresses back 128->64
+        self.projection = nn.Sequential(
+            nn.Conv2d(hidden_channels, proj_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(proj_channels, hidden_channels, kernel_size=1)
+        )
+        # Pools spatial grid to (4,5) bins by averaging; adaptive average allows FNO to have resolution invariance
+        self.pool = nn.AdaptiveAvgPool2d((4,5))
+
+        # Expands channels 128->256, applies GELU, and compresses 256->64, GELU, Dropout(0.1)
+        head_layers = []
+        head_in = hidden_channels * pool_size[0] * pool_size[1]  # 64 * 4 * 5 = 1280
+        prev = head_in
+        for h in head_hidden:
+            head_layers += [nn.Linear(prev, h), nn.GELU(), nn.Dropout(0.1)]
+            prev = h
+
+        # Linear(64->5)
+        head_layers.append(nn.Linear(prev, out_dim))
+        self.head = nn.Sequential(*head_layers)
+
+        # # Optional auxilary head
+        # self.aux_head = nn.Sequential(
+        #     nn.Linear(head_in, 64),
+        #     nn.GELU(),
+        #     nn.Linear(64, 3)
+        # )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
     # Shape of x is [batch, in_channel, n_k, n_tau]
         x = self.lifting(x) #[batch, in_channel, n_k, n_tau] -> [batch, hidden_channels, n_k, n_tau]
         for block in self.fourier_blocks:
             x = block(x)
+        x = self.projection(x)
+        x_pooled = self.pool(x).flatten(1)
+        x = self.head(x_pooled)
+        # aux = self.aux_head(x_pooled) # Optional auxilary head
+        
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
