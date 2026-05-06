@@ -24,10 +24,13 @@ grid:
   tau_max: 2.0
 
 fno:
-  in_channel: 3
+  in_channel: 1
   hidden_channels: 64
-  modes1: 12
-  modes2: 12
+  layer_modes:
+    - [12, 8]
+    - [10, 7]
+    - [8, 6]
+    - [6, 5]
   n_blocks: 4
   proj_channels: 128
   pool_size: [4, 5]

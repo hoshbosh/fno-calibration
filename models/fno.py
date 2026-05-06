@@ -59,17 +59,12 @@ class FourierBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.activation(self.spectral_conv(x) + self.pointwise_conv(x))
 
-
-
-
 class FNO2d(nn.Module):
     def __init__(
             self, 
             in_channel: int, 
             hidden_channels: Sequence[int], 
-            modes1: int,
-            modes2: int,
-            n_blocks: int,
+            layer_modes: Sequence[tuple[int, int]],
             proj_channels: int,
             pool_size: Sequence[int],
             head_hidden: Sequence[int],
@@ -80,8 +75,35 @@ class FNO2d(nn.Module):
         # Lifting layer, convolutional transformation into 64 channels
         self.lifting = nn.Conv2d(in_channel, hidden_channels, kernel_size=1)
         self.fourier_blocks = nn.ModuleList([
-            FourierBlock(hidden_channels, modes1, modes2) for _ in range(n_blocks)
+            FourierBlock(hidden_channels, m1, m2) for m1, m2 in layer_modes
         ])
+        # Expands channels 64->128, applies GELU nonlinearity, then compresses back 128->64
+        self.projection = nn.Sequential(
+            nn.Conv2d(hidden_channels, proj_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(proj_channels, hidden_channels, kernel_size=1)
+        )
+        # Pools spatial grid to (4,5) bins by averaging; adaptive average allows FNO to have resolution invariance
+        self.pool = nn.AdaptiveAvgPool2d((4,5))
+
+        # Expands channels 128->256, applies GELU, and compresses 256->64, GELU, Dropout(0.1)
+        head_layers = []
+        head_in = hidden_channels * pool_size[0] * pool_size[1]  # 64 * 4 * 5 = 1280
+        prev = head_in
+        for h in head_hidden:
+            head_layers += [nn.Linear(prev, h), nn.GELU(), nn.Dropout(0.1)]
+            prev = h
+
+        # Linear(64->5)
+        head_layers.append(nn.Linear(prev, out_dim))
+        self.head = nn.Sequential(*head_layers)
+
+        # # Optional auxilary head
+        # self.aux_head = nn.Sequential(
+        #     nn.Linear(head_in, 64),
+        #     nn.GELU(),
+        #     nn.Linear(64, 3)
+        # )
 
     def forward(
             self,
@@ -109,7 +131,16 @@ class FNO2d(nn.Module):
 
         x = self.lifting(x)              # -> (batch, hidden_channels, n_k, n_tau)
         for block in self.fourier_blocks:
+<<<<<<< jlabasbas/fno-input-refactor
             x = block(x)                 # shape preserved
+=======
+            x = block(x)
+        x = self.projection(x)
+        x_pooled = self.pool(x).flatten(1)
+        x = self.head(x_pooled)
+        # aux = self.aux_head(x_pooled) # Optional auxilary head
+        
+>>>>>>> master
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
@@ -117,9 +148,7 @@ def build_fno(cfg : dict) -> FNO2d:
     return FNO2d(
             in_channel=f["in_channel"],
             hidden_channels=f["hidden_channels"],
-            modes1=f["modes1"],
-            modes2=f["modes2"],
-            n_blocks=f["n_blocks"],
+            layer_modes = f['layer_modes'],
             proj_channels=f["proj_channels"],
             pool_size=f["pool_size"],
             head_hidden=f["head_hidden"],
