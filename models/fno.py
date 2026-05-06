@@ -105,16 +105,42 @@ class FNO2d(nn.Module):
         #     nn.Linear(64, 3)
         # )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-    # Shape of x is [batch, in_channel, n_k, n_tau]
-        x = self.lifting(x) #[batch, in_channel, n_k, n_tau] -> [batch, hidden_channels, n_k, n_tau]
+    def forward(
+            self,
+            iv_surface: torch.Tensor,
+            k_grid: torch.Tensor,
+            tau_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        # iv_surface: (batch, 1, n_k, n_tau)
+        # k_grid:     (n_k,)
+        # tau_grid:   (n_tau,)
+        batch = iv_surface.shape[0]
+
+        # Build coordinate channels on-the-fly from the (possibly resolution-varying) grid.
+        # meshgrid with indexing='ij' so K varies along axis 0 (n_k) and T along axis 1 (n_tau).
+        K, T = torch.meshgrid(
+            k_grid.to(iv_surface.device),
+            tau_grid.to(iv_surface.device),
+            indexing="ij",
+        )
+        # Stack into (2, n_k, n_tau), add batch dim, expand (no copy) to (batch, 2, n_k, n_tau).
+        coords = torch.stack([K, T], dim=0).unsqueeze(0).expand(batch, -1, -1, -1)
+
+        # Concatenate IV with coord channels -> (batch, 3, n_k, n_tau)
+        x = torch.cat([iv_surface, coords], dim=1)
+
+        x = self.lifting(x)              # -> (batch, hidden_channels, n_k, n_tau)
         for block in self.fourier_blocks:
+<<<<<<< jlabasbas/fno-input-refactor
+            x = block(x)                 # shape preserved
+=======
             x = block(x)
         x = self.projection(x)
         x_pooled = self.pool(x).flatten(1)
         x = self.head(x_pooled)
         # aux = self.aux_head(x_pooled) # Optional auxilary head
         
+>>>>>>> master
         return x
     
 def build_fno(cfg : dict) -> FNO2d:
@@ -137,11 +163,27 @@ if __name__ == "__main__":
 
     model = build_fno(cfg)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    x = torch.randn(8, cfg["fno"]["in_channel"], cfg["grid"]["n_k"], cfg["grid"]["n_tau"])                                                   
-    y = model(x)                                                                                                                             
-    print(f"FNO2d: {n_params:,} params | input {tuple(x.shape)} -> output {tuple(y.shape)}")                                                 
-                                                                                                                                           
+
+    # Native grid from config
+    n_k, n_tau = cfg["grid"]["n_k"], cfg["grid"]["n_tau"]
+    k_grid = torch.linspace(cfg["grid"]["k_min"], cfg["grid"]["k_max"], n_k)
+    tau_grid = torch.tensor(
+        [cfg["grid"]["tau_min"] * (cfg["grid"]["tau_max"] / cfg["grid"]["tau_min"]) ** (i / (n_tau - 1))
+         for i in range(n_tau)],
+        dtype=torch.float32,
+    )
+    iv = torch.randn(8, 1, n_k, n_tau)
+    y = model(iv, k_grid, tau_grid)
+    print(f"FNO2d: {n_params:,} params | input {tuple(iv.shape)} -> output {tuple(y.shape)}")
+
     # Resolution invariance check: same model, different grid
-    x2 = torch.randn(2, cfg["fno"]["in_channel"], 32, 40)                                                                                    
-    y2 = model(x2)                                                                                                                           
-    print(f"  resolution check: {tuple(x2.shape)} -> {tuple(y2.shape)}")
+    n_k2, n_tau2 = 32, 40
+    k_grid2 = torch.linspace(cfg["grid"]["k_min"], cfg["grid"]["k_max"], n_k2)
+    tau_grid2 = torch.tensor(
+        [cfg["grid"]["tau_min"] * (cfg["grid"]["tau_max"] / cfg["grid"]["tau_min"]) ** (i / (n_tau2 - 1))
+         for i in range(n_tau2)],
+        dtype=torch.float32,
+    )
+    iv2 = torch.randn(2, 1, n_k2, n_tau2)
+    y2 = model(iv2, k_grid2, tau_grid2)
+    print(f"  resolution check: {tuple(iv2.shape)} -> {tuple(y2.shape)}")
