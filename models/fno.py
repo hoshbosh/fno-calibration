@@ -59,17 +59,12 @@ class FourierBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.activation(self.spectral_conv(x) + self.pointwise_conv(x))
 
-
-
-
 class FNO2d(nn.Module):
     def __init__(
             self, 
             in_channel: int, 
             hidden_channels: Sequence[int], 
-            modes1: int,
-            modes2: int,
-            n_blocks: int,
+            layer_modes: Sequence[tuple[int, int]],
             proj_channels: int,
             pool_size: Sequence[int],
             head_hidden: Sequence[int],
@@ -80,7 +75,7 @@ class FNO2d(nn.Module):
         # Lifting layer, convolutional transformation into 64 channels
         self.lifting = nn.Conv2d(in_channel, hidden_channels, kernel_size=1)
         self.fourier_blocks = nn.ModuleList([
-            FourierBlock(hidden_channels, modes1, modes2) for _ in range(n_blocks)
+            FourierBlock(hidden_channels, m1, m2) for m1, m2 in layer_modes
         ])
         # Expands channels 64->128, applies GELU nonlinearity, then compresses back 128->64
         self.projection = nn.Sequential(
@@ -127,9 +122,7 @@ def build_fno(cfg : dict) -> FNO2d:
     return FNO2d(
             in_channel=f["in_channel"],
             hidden_channels=f["hidden_channels"],
-            modes1=f["modes1"],
-            modes2=f["modes2"],
-            n_blocks=f["n_blocks"],
+            layer_modes = f['layer_modes'],
             proj_channels=f["proj_channels"],
             pool_size=f["pool_size"],
             head_hidden=f["head_hidden"],
