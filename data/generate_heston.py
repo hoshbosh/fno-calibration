@@ -112,7 +112,15 @@ def lhs_params(cfg: dict[str, Any], n: int, rng: np.random.Generator) -> NDArray
 
 def build_grid(cfg: dict[str, Any]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     g = cfg["grid"]
-    k = np.linspace(g["k_min"], g["k_max"], g["n_k"])
+
+    # Log-moneyness is denser near ATM where the smile curve is the sharpest
+    # Split the 16 points into 4 deep OTM puts, 8 near-ATM | 4 deep OTM calls
+    # Slices at the ends are to prevent shared endpoints from appearing twice
+    k = np.concatenate([
+        np.linspace(g["k_min"], -g["k_atm"], g["n_k_wing"] + 1)[:-1],
+        np.linspace(-g["k_atm"], g["k_atm"], g["n_k_atm"]),
+        np.linspace(g["k_atm"], g["k_max"], g["n_k_wing"] + 1)[1:],
+        ])
     tau = np.geomspace(g["tau_min"], g["tau_max"], g["n_tau"])
     return k, tau
 
