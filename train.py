@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 
 from data.dataset import ParamNormalizer, split_datasets
 from models.mlp_baseline import build_mlp
+from data.generate_heston import build_grid
+from models.fno import build_fno
 
 PARAM_NAMES = ["kappa", "theta", "xi", "rho", "v0"]
 
@@ -44,12 +46,27 @@ def make_loaders(cfg: dict) -> tuple[DataLoader, DataLoader, ParamNormalizer]:
 
     return train_loader, val_loader, normalizer
 
+# FNO wrapper that associates a grid to the IV channel 
+class FNOWithGrid(nn.Module):
+    def __init__(self, fno: nn.Module, k_grid: np.ndarray, tau_grid: np.ndarray) -> None:
+        super().__init__()
+        self.fno = fno
+        # We use buffers here because buffers get sent to the device with the tensor for free
+        self.register_buffer("k_grid", torch.as_tensor(k_grid, dtype=torch.float32))
+        self.register_buffer("tau_grid", torch.as_tensor(tau_grid, dtype=torch.float32))
+
+    def forward(self, surface: torch.Tensor) -> torch.Tensor:
+        # The actual concating
+        return self.fno(surface, self.k_grid, self.tau_grid)
+            
+
 def build_model(cfg: dict, name: str) -> nn.Module:
     if name == "mlp":
         return build_mlp(cfg)
     if name == "fno":
-        pass
-        # return build_fno(cfg)
+        fno = build_fno(cfg)
+        k_grid, tau_grid = build_grid(cfg)
+        return FNOWithGrid(fno, k_grid, tau_grid)
     raise ValueError("Unknown model given")
 
 def train_one_epoch(model: nn.Module, loader: DataLoader,

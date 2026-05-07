@@ -24,7 +24,7 @@ grid:
   tau_max: 2.0
 
 fno:
-  in_channel: 1
+  in_channel: 3
   hidden_channels: 64
   layer_modes:
     - [12, 8]
