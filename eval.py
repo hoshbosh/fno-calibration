@@ -79,8 +79,19 @@ def iv_reconstruction_rmse(
     flags = np.where(k_grid >= 0, "c", "p")
     n_k, n_tau = len(k_grid), len(tau_grid)
 
+    # Clip predicted params to training ranges before re-pricing. Models with
+    # unbounded regression heads can overshoot (e.g., rho < -1), which QuantLib's
+    # HestonModel rejects. Phase 0 expedient — proper fix is sigmoid output
+    # scaling at the model head.
+    lo = np.array([h["kappa"][0], h["theta"][0], h["xi"][0], h["rho"][0], h["v0"][0]])
+    hi = np.array([h["kappa"][1], h["theta"][1], h["xi"][1], h["rho"][1], h["v0"][1]])
+    pred_clipped = np.clip(pred_raw, lo, hi)
+    n_clipped = int((pred_raw != pred_clipped).any(axis=1).sum())
+    if n_clipped:
+        print(f"[iv_reconstruction] {n_clipped}/{len(pred_raw)} predictions clipped to training range.")
+
     rmse = np.empty(len(pred_raw), dtype=np.float32)
-    for i, (kappa, theta, xi, rho, v0) in enumerate(pred_raw):
+    for i, (kappa, theta, xi, rho, v0) in enumerate(pred_clipped):
         iv_pred = np.full((n_k, n_tau), np.nan, dtype=np.float64)
 
         # Loop over maturities because the strike vector depends on tau:
@@ -89,11 +100,16 @@ def iv_reconstruction_rmse(
         for j, tau in enumerate(tau_grid):
             F = s0 * np.exp((r - q) * tau)
             strikes = F * np.exp(k_grid)
-            prices = heston_option_prices(
-                s0, r, q,
-                float(kappa), float(theta), float(xi), float(rho), float(v0),
-                strikes, [tau], flags,
-            )[:, 0]
+            try:
+                prices = heston_option_prices(
+                    s0, r, q,
+                    float(kappa), float(theta), float(xi), float(rho), float(v0),
+                    strikes, [tau], flags,
+                )[:, 0]
+            except RuntimeError:
+                # QuantLib rejected the parameter combination even after clipping
+                # (rare boundary cases). Skip column; nanmean handles it.
+                continue
             # If pricing fails for this maturity (engine NaN), skip the column.
             # Unlike the generator, eval doesn't reject — bad columns become NaN
             # and are excluded from the per-surface RMSE by nanmean.
