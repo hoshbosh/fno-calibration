@@ -19,6 +19,9 @@ grid:
   n_k: 16
   k_min: -0.5
   k_max: 0.5
+  k_atm: 0.1
+  n_k_wing: 4
+  n_k_atm: 8
   n_tau: 20
   tau_min: 0.02
   tau_max: 2.0
