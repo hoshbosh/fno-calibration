@@ -11,6 +11,7 @@ import h5py
 import yaml
 import QuantLib as ql
 from py_vollib_vectorized import vectorized_implied_volatility
+from scipy.stats.qmc import LatinHypercube
 
 
 def is_arbitrage_free(iv: NDArray[np.floating], taus: NDArray[np.floating],
@@ -94,19 +95,20 @@ def heston_option_prices(s0: float, r: float, q: float,
     return prices
 
 
-def sample_params(cfg: dict[str, Any], rng: np.random.Generator) -> NDArray[np.float64]:
-    '''
-    Create random values for each parameter
-    '''
+def lhs_params(cfg: dict[str, Any], n: int, rng: np.random.Generator) -> NDArray[np.float64]:
+    """
+    Generate samples using Latin Hypercube sampling
+    """
     h = cfg["heston"]
-    return np.array([
-        rng.uniform(*h["kappa"]),
-        rng.uniform(*h["theta"]),
-        rng.uniform(*h["xi"]),
-        rng.uniform(*h["rho"]),
-        rng.uniform(*h["v0"]),
-    ])
 
+    sampler = LatinHypercube(d=5, rng=rng)
+
+    u = sampler.random(n=n)
+
+    lo = np.array([h["kappa"][0], h["theta"][0],h["xi"][0],h["rho"][0],h["v0"][0]])
+    hi = np.array([h["kappa"][1], h["theta"][1],h["xi"][1],h["rho"][1],h["v0"][1]])
+
+    return lo + u * (hi - lo)
 
 def build_grid(cfg: dict[str, Any]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     g = cfg["grid"]
@@ -143,12 +145,32 @@ def main() -> None:
 
     accepted = 0
     attempts = 0
+    feller_violations = 0  # flag-don't-drop: count parameter draws with 2*kappa*theta <= xi^2
+
+    # LHS is a *batch* design — stratification is a property of the whole pool,
+    # not individual draws. Pre-generate a pool sized for expected rejection rate;
+    # refill if exhausted (each refill is its own LHS, locally stratified).
+    BUFFER_FACTOR = 2
+    pool = lhs_params(cfg, n * BUFFER_FACTOR, rng)
+    pool_idx = 0
 
     # Generate a surface, if it is invalid via NaNs or arbitrage, reject the surface
     while accepted < n:
+        if pool_idx >= len(pool):
+            print(f" LHS pool exhausted at {accepted}/{n}; drawing fresh batch.")
+            pool = lhs_params(cfg, n * BUFFER_FACTOR, rng)
+            pool_idx = 0
+
+        p = pool[pool_idx]
+        pool_idx += 1
         attempts += 1
-        p = sample_params(cfg, rng)
+
         kappa, theta, xi, rho, v0 = p
+        # Feller condition: 2*kappa*theta > xi^2 ensures the variance process
+        # stays strictly positive. Heston is still valid when violated (variance
+        # just touches zero occasionally), so we keep these samples and only count.
+        if 2 * kappa * theta <= xi ** 2:
+            feller_violations += 1
 
         iv_surface = np.full((len(k_grid), len(tau_grid)), np.nan)
         ok = True
@@ -192,7 +214,8 @@ def main() -> None:
         f.attrs["r"] = r
         f.attrs["q"] = q
     print(f"wrote {n} surfaces to {out} ({attempts} attempts, "
-          f"{1 - n/attempts:.2%} rejected)")
+          f"{1 - n/attempts:.2%} rejected, "
+          f"{feller_violations}/{attempts} Feller violations)")
 
 
 if __name__ == "__main__":
