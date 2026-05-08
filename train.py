@@ -71,19 +71,25 @@ def build_model(cfg: dict, name: str) -> nn.Module:
 
 def train_one_epoch(model: nn.Module, loader: DataLoader,
                     loss_fn: nn.Module, optim: torch.optim.Optimizer,
-                    device: str) -> float:
+                    device: str, scaler: torch.amp.GradScaler) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
+    use_amp = (device == "cuda")
     for surface, target_z in loader:
         surface = surface.to(device, non_blocking=True)
         target_z = target_z.to(device, non_blocking=True)
 
-        optim.zero_grad()
-        pred_z = model(surface)
-        loss = loss_fn(pred_z, target_z)
-        loss.backward()
-        optim.step()
+        optim.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            pred_z = model(surface)
+            loss = loss_fn(pred_z, target_z)
+        # loss.backward()
+        # optim.step()
+        scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
 
         total_loss += loss.item()
         n_batches += 1
@@ -97,17 +103,19 @@ def validate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module,
     n_batches = 0
     sq_err_sum = torch.zeros(5, device = device)
     n_seen = 0
+    use_amp = (device == "cuda")
     for surface, target_z in loader:
         surface = surface.to(device, non_blocking=True)
         target_z = target_z.to(device, non_blocking=True)
-
-        pred_z = model(surface)
-        loss = loss_fn(pred_z, target_z)
+        
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            pred_z = model(surface)
+            loss = loss_fn(pred_z, target_z)
 
         total_loss += loss.item()
         n_batches += 1
 
-        sq_err_sum += ((pred_z - target_z) ** 2).sum(dim=0)
+        sq_err_sum += ((pred_z - target_z) ** 2).sum(dim=0).float()
         n_seen += target_z.shape[0]
 
     mean_loss = total_loss / max(n_batches, 1)
@@ -156,6 +164,9 @@ def main() -> None:
     scheduler = CosineAnnealingLR(optim, T_max=epochs)
     loss_fn = nn.MSELoss()
 
+    use_amp = (device=="cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
 # run_name = f"{args.model}-{time.strftime('%Y%m%d-%H%M%S')}"
 #           wandb.init( 
 #           project=cfg["wandb"]["project"],                                                                               
@@ -170,7 +181,7 @@ def main() -> None:
     best_val = float("inf")                                                                                            
    
     for epoch in range(epochs):                                                                                        
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device)
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler)
         val_loss, rmse_raw = validate(model, val_loader, loss_fn, device, normalizer)                                  
         scheduler.step()
                                                                                                                      
