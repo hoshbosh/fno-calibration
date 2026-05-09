@@ -48,6 +48,7 @@ mlp:
 train:
   batch_size: 64
   early_stopping_patience: 30
+  grad_clip: 1.0
   epochs: 100
   lr: 1.0e-3
   weight_decay: 1.0e-4

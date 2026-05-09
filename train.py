@@ -72,7 +72,8 @@ def build_model(cfg: dict, name: str) -> nn.Module:
 def train_one_epoch(model: nn.Module, loader: DataLoader,
                     loss_fn: nn.Module, optim: torch.optim.Optimizer,
                     device: str, scaler: torch.amp.GradScaler,
-                    scheduler: torch.optim.lr_scheduler.OneCycleLR) -> float:
+                    scheduler: torch.optim.lr_scheduler.OneCycleLR,
+                    grad_clip: float) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -89,6 +90,8 @@ def train_one_epoch(model: nn.Module, loader: DataLoader,
         # loss.backward()
         # optim.step()
         scaler.scale(loss).backward()
+        scaler.unscale_(optim)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         scaler.step(optim)
         scaler.update()
         scheduler.step()
@@ -189,9 +192,14 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt_path = os.path.join(args.out_dir, f"{args.model}_best.pt")
     best_val = float("inf")                                                                                            
+    # Patience is used for stopping the training if validation loss does not improve, stopping early to prevent overfitting
+    epochs_since_best = 0
+    patience = cfg["train"]["early_stopping_patience"]
+
+    grad_clip = cfg["train"]["grad_clip"]
    
     for epoch in range(epochs):                                                                                        
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler, scheduler)
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler, scheduler, grad_clip)
         val_loss, rmse_raw = validate(model, val_loader, loss_fn, device, normalizer)                                  
                                                                                                                      
         log = { 
@@ -209,9 +217,21 @@ def main() -> None:
                                                                                                                      
         if val_loss < best_val:
           best_val = val_loss                                                                                        
+          epochs_since_best = 0
           save_checkpoint(ckpt_path, model, args.model, cfg, normalizer, epoch, val_loss)
+        else:
+            # we have not improved for another epoch
+            epochs_since_best += 1
+
+        if epochs_since_best >= patience:
+            print(f"early stopping at epoch {epoch}")
+            break
                                                                                                                      
     print(f"best val loss: {best_val:.4f} | checkpoint: {ckpt_path}")                                                  
+
+    # useful for the future
+    # state = torch.load(ckpt_path, map_location=device)
+    # model.load_state_dict(state["model_state"])
   # wandb.finish()                                                                                                     
                                                                                                                          
                   
