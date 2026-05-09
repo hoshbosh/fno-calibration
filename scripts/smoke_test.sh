@@ -31,10 +31,10 @@ gen "$TEST"   200 44
 gen "$OOD"    100 45
 
 echo "=== [2/4] Training FNO ($EPOCHS epochs) ==="
-python train.py --config "$CONFIG" --model fno --epochs "$EPOCHS" --wandb_mode disabled
+python train.py --config "$CONFIG" --model fno --epochs "$EPOCHS" --wandb_mode online
 
 echo "=== [3/4] Training MLP ($EPOCHS epochs) ==="
-python train.py --config "$CONFIG" --model mlp --epochs "$EPOCHS" --wandb_mode disabled
+python train.py --config "$CONFIG" --model mlp --epochs "$EPOCHS" --wandb_mode online
 
 echo "=== [4/4] Evaluating both models ==="
 python eval.py --config "$CONFIG" --checkpoint checkpoints/fno_best.pt
