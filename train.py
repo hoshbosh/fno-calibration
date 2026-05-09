@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
-from data.dataset import ParamNormalizer, split_datasets
+from data.dataset import ParamNormalizer, load_datasets
 from models.mlp_baseline import build_mlp
 from data.generate_heston import build_grid
 from models.fno import build_fno
@@ -33,11 +33,11 @@ def setup_seeds(seed: int) -> None:
     np.random.seed(seed)
 
 def make_loaders(cfg: dict) -> tuple[DataLoader, DataLoader, ParamNormalizer]:
-    train_ds, val_ds, _test_ds, normalizer = split_datasets(
-        h5_path=cfg["data"]["path"],
-        train_frac=cfg["data"]["train_frac"],
-        val_frac=cfg["data"]["val_frac"],
-        seed=cfg["data"]["seed"]
+    train_ds, val_ds, _test_ds, _ood_ds, normalizer = load_datasets(
+        train_path=cfg["data"]["train_path"],
+        val_path=cfg["data"]["val_path"],
+        test_path=cfg["data"].get("test_path"),
+        ood_path=cfg["data"].get("ood_path"),
     )
     bs = cfg["train"]["batch_size"]
     nw = cfg["train"]["num_workers"]
