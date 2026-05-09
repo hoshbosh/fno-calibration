@@ -1,11 +1,13 @@
+# Smoke-test config — small dedicated train/val/test h5s, fast convergence.
+# Used by scripts/smoke_test.sh to verify the full pipeline end-to-end on CPU.
 data:
-  train_path: data/heston_train_100k.h5
-  val_path: data/heston_val_10k.h5
-  test_path: data/heston_test_10k.h5
-  ood_path: data/heston_ood_5k.h5
+  train_path: outputs/smoke_train.h5
+  val_path:   outputs/smoke_val.h5
+  test_path:  outputs/smoke_test.h5
+  ood_path:   outputs/smoke_ood.h5
   seed: 42
 
-heston: 
+heston:
   kappa: [0.5, 5.0]
   theta: [0.02, 0.15]
   xi: [0.1, 1.0]
@@ -47,16 +49,15 @@ mlp:
 
 train:
   batch_size: 64
-  early_stopping_patience: 30
+  early_stopping_patience: 5
   grad_clip: 1.0
-  epochs: 100
+  epochs: 20
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  num_workers: 2
+  num_workers: 0
 
 wandb:
   project: fno-calibration
   entity: null
 
 checkpoint_dir: checkpoints
-

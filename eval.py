@@ -7,7 +7,7 @@ import yaml
 from numpy.typing import NDArray
 from torch.utils.data import DataLoader
 
-from data.dataset import HestonSurfaceDataset, ParamNormalizer, split_datasets
+from data.dataset import HestonSurfaceDataset, ParamNormalizer, load_datasets
 from data.generate_heston import heston_option_prices, prices_to_iv, build_grid
 from train import build_model
 
@@ -19,6 +19,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--split", choices=["test", "ood"], default="test",
+                    help="Which evaluation split to run against.")
     return ap.parse_args()
 
 def load_from_checkpoint(path: str, cfg:dict, device:str) -> tuple[nn.Module, str, ParamNormalizer]:
@@ -132,30 +134,34 @@ def main() -> None:
         cfg: dict = yaml.safe_load(f)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
                                                                                                        
-    # Same seed + fractions as train.py → identical test split, no leakage.
-    _, _, test_ds, _ = split_datasets(
-        h5_path=cfg["data"]["path"],                                                                     
-        train_frac=cfg["data"]["train_frac"],                                                            
-        val_frac=cfg["data"]["val_frac"],
-        seed=cfg["data"]["seed"],                                                                        
-    )                                                                                                    
+    # Dedicated test/OOD files — no fractional split, no leakage by construction.
+    # Normalizer is fit on train (or loaded from sidecar) and shared across splits.
+    _train_ds, _val_ds, test_ds, ood_ds, _normalizer = load_datasets(
+        train_path=cfg["data"]["train_path"],
+        val_path=cfg["data"].get("val_path"),
+        test_path=cfg["data"].get("test_path"),
+        ood_path=cfg["data"].get("ood_path"),
+    )
+    eval_ds = ood_ds if args.split == "ood" else test_ds
+    if eval_ds is None:
+        raise ValueError(f"Config has no {args.split}_path set.")
 
     model, model_name, normalizer = load_from_checkpoint(                                                
         args.checkpoint, cfg, device
     )
 
-    preds_z, targets_z = predict_all(model, test_ds, device, args.batch_size)                            
+    preds_z, targets_z = predict_all(model, eval_ds, device, args.batch_size)
     preds_raw: NDArray[np.floating] = normalizer.decode(preds_z)
-    targets_raw: NDArray[np.floating] = normalizer.decode(targets_z)                                     
-                                                                                                       
-    rmse, rel_med, rel_p95 = per_param_metrics(preds_raw, targets_raw)
-                                                                                                       
-    k_grid, tau_grid = build_grid(cfg)                                                                   
-    iv_rmse = iv_reconstruction_rmse(
-        preds_raw, test_ds.surfaces, k_grid, tau_grid, cfg                                               
-    )                                                                                                    
+    targets_raw: NDArray[np.floating] = normalizer.decode(targets_z)
 
-    print(f"\n=== {model_name} | {len(test_ds)} test surfaces ===")                                      
+    rmse, rel_med, rel_p95 = per_param_metrics(preds_raw, targets_raw)
+
+    k_grid, tau_grid = build_grid(cfg)
+    iv_rmse = iv_reconstruction_rmse(
+        preds_raw, eval_ds.surfaces, k_grid, tau_grid, cfg
+    )
+
+    print(f"\n=== {model_name} | {args.split} | {len(eval_ds)} surfaces ===")
     print(f"{'param':<8} {'rmse':>10} {'rel_med':>10} {'rel_p95':>10}")
     for name, r, m, p in zip(PARAM_NAMES, rmse, rel_med, rel_p95):                                       
         print(f"{name:<8} {r:>10.4f} {m:>10.2%} {p:>10.2%}")                                             
