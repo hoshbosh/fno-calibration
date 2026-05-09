@@ -3,6 +3,7 @@ Generates synthetic heston iv surfaces
 """
 
 import argparse
+import json
 import os
 from typing import Any, Sequence
 import numpy as np
@@ -13,23 +14,98 @@ import QuantLib as ql
 from py_vollib_vectorized import vectorized_implied_volatility
 from scipy.stats.qmc import LatinHypercube
 
+def _d2_dk2_nonuniform(
+        w: NDArray[np.floating],
+        k_grid: NDArray[np.floating],
+        ) -> NDArray[np.floating]:
+    """
+    Discrete second derivative of w(k, tau) along k at interior points,
+    accurate on non-uniform grids. Returns shape (n_k - 2, n_tau).
+
+    Composing np.gradient twice gives a wider-stencil approximation that
+    amplifies noise where spacing jumps (e.g., at our ATM/wing segment join).
+    The explicit non-uniform 3-point formula below is exact for quadratics
+    regardless of spacing.
+    """
+    h = np.diff(k_grid)              # (n_k - 1,)
+    h_minus = h[:-1, None]           # (n_k - 2, 1) for broadcasting against (n_k, n_tau)
+    h_plus = h[1:, None]             # (n_k - 2, 1)
+    df_minus = (w[1:-1, :] - w[:-2, :]) / h_minus
+    df_plus = (w[2:, :] - w[1:-1, :]) / h_plus
+    return 2.0 / (h_minus + h_plus) * (df_plus - df_minus)
+
+
+def audit_dataset(
+        surfaces: NDArray[np.floating],
+        k_grid: NDArray[np.floating],
+        tau_grid: NDArray[np.floating],
+        atol_cal: float = 1e-4,
+        atol_btf: float = 1e-1,
+        ) -> dict[str, int]:
+    '''
+    Post-hoc audit, checks whole dataset for any type of arbitrage violation.
+    Calendar and butterfly tolerances are split because the discrete second
+    derivative used in the butterfly check is much noisier on the non-uniform
+    k-grid than the first difference in tau.
+    '''
+    n_total = len(surfaces)
+    n_neg = 0
+    n_cal = 0
+    n_btf = 0
+
+    for iv in surfaces:
+        if np.any(~np.isfinite(iv)) or np.any(iv <= 0):
+            n_neg += 1
+            continue
+
+        w = (iv ** 2) * tau_grid[None, :]
+
+        if np.any(np.diff(w, axis=1) < -atol_cal):
+            n_cal += 1
+
+        d2w_dk2 = _d2_dk2_nonuniform(w, k_grid)
+        if np.any(d2w_dk2 < -atol_btf):
+            n_btf += 1
+
+    return {
+        "n_total": int(n_total),
+        "negative_iv": int(n_neg),
+        "calendar_violations": int(n_cal),
+        "butterfly_violations": int(n_btf),
+    }
+
 
 def is_arbitrage_free(iv: NDArray[np.floating], taus: NDArray[np.floating],
-                      atol: float = 1e-4) -> bool:
+                      k_grid: NDArray[np.floating],
+                      atol_cal: float = 1e-4,
+                      atol_btf: float = 1e-1) -> bool:
     '''
-    Check that the IV surface has no arbitrage
-    Conceptually, checking if total variance does not decrease.
-    An option with a longer time to maturity should have higher variance.
-    This is redundance since the Heston Process should not allow this to happen
+    Check that the IV surface has no arbitrage.
+    Conceptually: positivity, calendar (total variance non-decreasing in tau),
+    and butterfly (total variance convex in k). Heston is arbitrage-free
+    analytically — the gate exists to catch numerical pathologies.
+
+    Tolerances are split: butterfly is much looser than calendar because the
+    discrete second derivative on the non-uniform k-grid is noisier than the
+    first difference in tau.
     '''
-    # Reject if NaNs are present
+    # Reject if NaNs are present or negative ivs
     if np.any(~np.isfinite(iv)) or np.any(iv <= 0):
         return False
     # Convert implied volatility to total variance
     # Also flatten to 1 axis using the second term
     w = (iv ** 2) * taus[None, :]
-    # Checking across every lement of w, that variance does no decrease
-    return np.all(np.diff(w, axis=1) >= -atol)
+
+    # Calendar: reject when total variance drops by more than the tolerance.
+    if np.any(np.diff(w, axis=1) < -atol_cal):
+        return False
+
+    # Butterfly: w must be convex in k at each maturity.
+    d2w_dk2 = _d2_dk2_nonuniform(w, k_grid)
+    if np.any(d2w_dk2 < -atol_btf):
+        return False
+
+    return True
 
 
 def prices_to_iv(prices: NDArray[np.floating], s0: float, r: float, q: float,
@@ -201,7 +277,7 @@ def main() -> None:
                 break
             iv_surface[:, j] = iv_col
 
-        if not ok or not is_arbitrage_free(iv_surface, tau_grid):
+        if not ok or not is_arbitrage_free(iv_surface, tau_grid, k_grid):
             continue
 
         surfaces[accepted] = iv_surface.astype(np.float32)
@@ -221,9 +297,22 @@ def main() -> None:
         f.attrs["s0"] = s0
         f.attrs["r"] = r
         f.attrs["q"] = q
+
+    # Post-generation audit. Should be ~0 for a Heston dataset since the
+    # per-surface gate already rejected violations during generation. Non-zero
+    # counts indicate numerical noise or a generator regression.
+    audit = audit_dataset(surfaces, k_grid, tau_grid)
+    audit_path = out.replace(".h5", ".audit.json")
+    with open(audit_path, "w") as f:
+        json.dump(audit, f, indent=2)
+
     print(f"wrote {n} surfaces to {out} ({attempts} attempts, "
           f"{1 - n/attempts:.2%} rejected, "
           f"{feller_violations}/{attempts} Feller violations)")
+    print(f"audit: {audit['negative_iv']} negative-IV, "
+          f"{audit['calendar_violations']} calendar, "
+          f"{audit['butterfly_violations']} butterfly "
+          f"(of {audit['n_total']}); written to {audit_path}")
 
 
 if __name__ == "__main__":
