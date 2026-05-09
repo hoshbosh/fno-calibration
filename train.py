@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from data.dataset import ParamNormalizer, split_datasets
@@ -71,7 +71,8 @@ def build_model(cfg: dict, name: str) -> nn.Module:
 
 def train_one_epoch(model: nn.Module, loader: DataLoader,
                     loss_fn: nn.Module, optim: torch.optim.Optimizer,
-                    device: str, scaler: torch.amp.GradScaler) -> float:
+                    device: str, scaler: torch.amp.GradScaler,
+                    scheduler: torch.optim.lr_scheduler.OneCycleLR) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -90,6 +91,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader,
         scaler.scale(loss).backward()
         scaler.step(optim)
         scaler.update()
+        scheduler.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -161,7 +163,15 @@ def main() -> None:
     optim = AdamW(model.parameters(),
                   lr=cfg["train"]["lr"],
                   weight_decay=cfg["train"]["weight_decay"])
-    scheduler = CosineAnnealingLR(optim, T_max=epochs)
+    # Schedule for setting the learning rate
+    scheduler = OneCycleLR(
+            optim,
+            max_lr=cfg["train"]["lr"],
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.1,
+            anneal_strategy="cos",
+            )
     loss_fn = nn.MSELoss()
 
     use_amp = (device=="cuda")
@@ -181,9 +191,8 @@ def main() -> None:
     best_val = float("inf")                                                                                            
    
     for epoch in range(epochs):                                                                                        
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler)
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler, scheduler)
         val_loss, rmse_raw = validate(model, val_loader, loss_fn, device, normalizer)                                  
-        scheduler.step()
                                                                                                                      
         log = { 
           "epoch": epoch,                                                                                            
