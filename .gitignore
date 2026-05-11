@@ -6,4 +6,3 @@ data/*.h5
 outputs/                                                                                                               
 wandb/                                                                                                                 
 .ipynb_checkpoints/
-*.txt
