@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--model", choices=["mlp", "fno"], required=True)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Overrides cfg['data']['seed']. Used for torch/numpy seeding "
+                         "and to namespace the checkpoint + W&B run name.")
     ap.add_argument("--wandb_mode",  default="offline", choices=["online", "offline", "disabled"])
     ap.add_argument("--out_dir", default="checkpoints")
 
@@ -87,7 +90,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader,
 
         optim.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             pred_z = model(surface)
             loss = loss_fn(pred_z, target_z)
 
@@ -129,7 +132,7 @@ def validate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module,
         surface = surface.to(device, non_blocking=True)
         target_z = target_z.to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             pred_z = model(surface)
             loss = loss_fn(pred_z, target_z)
 
@@ -175,10 +178,11 @@ def main() -> None:
         cfg = yaml.safe_load(f)
 
     epochs = args.epochs if args.epochs is not None else cfg["train"]["epochs"]
+    seed = args.seed if args.seed is not None else cfg["data"]["seed"]
 
-    setup_seeds(cfg["data"]["seed"])
+    setup_seeds(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device} | model: {args.model} epoch: {epochs}")
+    print(f"device: {device} | model: {args.model} | seed: {seed} | epochs: {epochs}")
 
     train_loader, val_loader, normalizer = make_loaders(cfg)
     print(f"train batches: {len(train_loader)} | val batches {len(val_loader)}")
@@ -202,21 +206,24 @@ def main() -> None:
     loss_fn = nn.MSELoss()
 
     use_amp = (device=="cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # bf16 has the same exponent range as fp32, so gradient scaling isn't
+    # needed (no underflow). Scaler kept in the call sites as a no-op for
+    # API compatibility with the fp16 path.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-    run_name = f"{args.model}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"{args.model}-seed{seed}-{time.strftime('%Y%m%d-%H%M%S')}"
     wandb.init(
         project=cfg["wandb"]["project"],
         entity=cfg["wandb"]["entity"],
         mode=args.wandb_mode,
         config={**cfg, "model_arch": args.model, "n_params": n_params,
-                "device": device, "epochs_planned": epochs},
+                "seed": seed, "device": device, "epochs_planned": epochs},
         name=run_name,
     )
     log_to_wandb = (args.wandb_mode != "disabled")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.out_dir, f"{args.model}_best.pt")
+    ckpt_path = os.path.join(args.out_dir, f"{args.model}_seed{seed}_best.pt")
     best_val = float("inf")
     # Patience is used for stopping the training if validation loss does not improve, stopping early to prevent overfitting
     epochs_since_best = 0

@@ -24,30 +24,41 @@ class SpectralConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, _, n_k, n_tau = x.shape
+        in_dtype = x.dtype
 
-        x_ft = torch.fft.rfft2(x)
+        # cuFFT in fp16 only supports power-of-two signal sizes; n_tau=20 isn't.
+        # Run the FFT path in fp32 regardless of AMP autocast, then cast back so
+        # the rest of the block stays in fp16.
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x_fp32 = x.float()
+            x_ft = torch.fft.rfft2(x_fp32)
 
-        m1 = min(self.modes1, n_k)
-        m2 = min(self.modes2, n_tau // 2 + 1)
+            # Cap m1 at n_k // 2 so the [:m1] (positive freqs) and [-m1:] (negative
+            # freqs) slices don't overlap — overlap silently overwrites weights1
+            # contributions and leaves those rows of weights1 dead (no gradient).
+            m1 = min(self.modes1, n_k // 2)
+            m2 = min(self.modes2, n_tau // 2 + 1)
 
-        out_ft = torch.zeros(
-                batch, self.out_channels, n_k, n_tau // 2 + 1,
-                dtype=torch.cfloat, device=x.device
-        )
-        out_ft[:, :, :m1, :m2] = torch.einsum(
-            "bixy, ioxy -> boxy",                                                                                                            
-            x_ft[:, :, :m1, :m2],                                                                                                            
-            self.weights1[:, :, :m1, :m2],                                                                                                   
-        )                                                                                                                                    
+            out_ft = torch.zeros(
+                    batch, self.out_channels, n_k, n_tau // 2 + 1,
+                    dtype=torch.cfloat, device=x.device
+            )
+            out_ft[:, :, :m1, :m2] = torch.einsum(
+                "bixy, ioxy -> boxy",
+                x_ft[:, :, :m1, :m2],
+                self.weights1[:, :, :m1, :m2],
+            )
 
-        if n_k > m1:
-            out_ft[:, :, -m1:, :m2] = torch.einsum(                                                                                          
-                "bixy, ioxy -> boxy",                                                                                                        
-                x_ft[:, :, -m1:, :m2],
-                self.weights2[:, :, :m1, :m2],                                                                                               
-            )                                                                                                                                
+            if n_k > m1:
+                out_ft[:, :, -m1:, :m2] = torch.einsum(
+                    "bixy, ioxy -> boxy",
+                    x_ft[:, :, -m1:, :m2],
+                    self.weights2[:, :, :m1, :m2],
+                )
 
-        return torch.fft.irfft2(out_ft, s=(n_k, n_tau))
+            out = torch.fft.irfft2(out_ft, s=(n_k, n_tau))
+
+        return out.to(in_dtype)
 
 class FourierBlock(nn.Module):
     def __init__(self, channels: int, modes1: int, modes2: int) -> None:

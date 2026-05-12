@@ -1,5 +1,8 @@
 from __future__ import annotations
 import argparse
+import json
+import os
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,7 +24,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--split", choices=["test", "ood"], default="test",
                     help="Which evaluation split to run against.")
+    ap.add_argument("--results_dir", default="results",
+                    help="Where to write the per-eval JSON + npz outputs.")
+    ap.add_argument("--skip_iv", action="store_true",
+                    help="Skip the slow QuantLib IV-reconstruction loop (useful "
+                         "for quick metric-only sweeps during ablation hunting).")
     return ap.parse_args()
+
+
+def parse_seed_from_path(path: str) -> int | None:
+    """Extract seed N from a filename like 'fno_seed42_best.pt'."""
+    m = re.search(r"seed(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else None
 
 def load_from_checkpoint(path: str, cfg:dict, device:str) -> tuple[nn.Module, str, ParamNormalizer]:
     # weights_only=False because the checkpoint pickles numpy arrays
@@ -156,19 +170,71 @@ def main() -> None:
 
     rmse, rel_med, rel_p95 = per_param_metrics(preds_raw, targets_raw)
 
-    k_grid, tau_grid = build_grid(cfg)
-    iv_rmse = iv_reconstruction_rmse(
-        preds_raw, eval_ds.surfaces, k_grid, tau_grid, cfg
-    )
+    iv_rmse: NDArray[np.floating] | None = None
+    if not args.skip_iv:
+        k_grid, tau_grid = build_grid(cfg)
+        iv_rmse = iv_reconstruction_rmse(
+            preds_raw, eval_ds.surfaces, k_grid, tau_grid, cfg
+        )
 
-    print(f"\n=== {model_name} | {args.split} | {len(eval_ds)} surfaces ===")
+    seed = parse_seed_from_path(args.checkpoint)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\n=== {model_name} | seed={seed} | {args.split} | {len(eval_ds)} surfaces ===")
     print(f"{'param':<8} {'rmse':>10} {'rel_med':>10} {'rel_p95':>10}")
-    for name, r, m, p in zip(PARAM_NAMES, rmse, rel_med, rel_p95):                                       
-        print(f"{name:<8} {r:>10.4f} {m:>10.2%} {p:>10.2%}")                                             
-    print(                                                                                               
-        f"\nIV reconstruction RMSE (vol points): "                                                       
-        f"median={np.median(iv_rmse):.4f}  p95={np.percentile(iv_rmse, 95):.4f}"                         
+    for name, r, m, p in zip(PARAM_NAMES, rmse, rel_med, rel_p95):
+        print(f"{name:<8} {r:>10.4f} {m:>10.2%} {p:>10.2%}")
+    if iv_rmse is not None:
+        print(
+            f"\nIV reconstruction RMSE (vol points): "
+            f"median={np.median(iv_rmse):.4f}  "
+            f"mean={float(np.mean(iv_rmse)):.4f}  "
+            f"p95={np.percentile(iv_rmse, 95):.4f}"
+        )
+
+    # Persist results so Task 5/6 (comparison table, scatter plots, worst-case
+    # heatmaps) can be regenerated without re-running the slow IV loop.
+    os.makedirs(args.results_dir, exist_ok=True)
+    seed_tag = f"seed{seed}" if seed is not None else "seedNA"
+    stem = f"{model_name}_{seed_tag}_{args.split}"
+
+    summary = {
+        "model": model_name,
+        "seed": seed,
+        "split": args.split,
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "n_eval_samples": int(len(eval_ds)),
+        "n_params": int(n_params),
+        "per_param": {
+            name: {
+                "rmse": float(r),
+                "rel_median": float(m),
+                "rel_p95": float(p),
+            }
+            for name, r, m, p in zip(PARAM_NAMES, rmse, rel_med, rel_p95)
+        },
+        "iv_rmse": (
+            None if iv_rmse is None else {
+                "median": float(np.median(iv_rmse)),
+                "mean": float(np.mean(iv_rmse)),
+                "p95": float(np.percentile(iv_rmse, 95)),
+            }
+        ),
+    }
+    json_path = os.path.join(args.results_dir, f"{stem}.json")
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # Raw arrays for downstream plotting (scatter, worst-case heatmaps).
+    npz_path = os.path.join(args.results_dir, f"{stem}.npz")
+    np.savez_compressed(
+        npz_path,
+        preds_raw=preds_raw.astype(np.float32),
+        targets_raw=targets_raw.astype(np.float32),
+        iv_rmse=(np.array([], dtype=np.float32) if iv_rmse is None
+                 else iv_rmse.astype(np.float32)),
     )
+    print(f"\nWrote {json_path} and {npz_path}")
 
 if __name__ == "__main__":
     main()
