@@ -29,9 +29,12 @@ grid:
 fno:
   in_channel: 3
   hidden_channels: 64
+  # modes1 capped at n_k // 2 = 8 to avoid the overlap bug
+  # (slices [:m1] and [-m1:] would otherwise overlap and the second write
+  # silently overwrites the first, leaving rows of weights1 dead).
   layer_modes:
-    - [12, 8]
-    - [10, 7]
+    - [8, 8]
+    - [8, 7]
     - [8, 6]
     - [6, 5]
   n_blocks: 4
@@ -42,14 +45,16 @@ fno:
 
 mlp:
   in_dim: 320
-  hidden: [512, 256, 128]
+  # Widened from [512, 256, 128] (~329k params) to ~2.4M params to
+  # match the FNO param count for an apples-to-apples architectural comparison.
+  hidden: [1024, 1024, 1024]
   out_dim: 5
 
 train:
   batch_size: 64
   early_stopping_patience: 30
   grad_clip: 1.0
-  epochs: 100
+  epochs: 200
   lr: 1.0e-3
   weight_decay: 1.0e-4
   num_workers: 2

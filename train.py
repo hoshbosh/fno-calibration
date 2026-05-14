@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
@@ -22,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--model", choices=["mlp", "fno"], required=True)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Overrides cfg['data']['seed']. Used for torch/numpy seeding "
+                         "and to namespace the checkpoint + W&B run name.")
     ap.add_argument("--wandb_mode",  default="offline", choices=["online", "offline", "disabled"])
     ap.add_argument("--out_dir", default="checkpoints")
 
@@ -73,9 +77,11 @@ def train_one_epoch(model: nn.Module, loader: DataLoader,
                     loss_fn: nn.Module, optim: torch.optim.Optimizer,
                     device: str, scaler: torch.amp.GradScaler,
                     scheduler: torch.optim.lr_scheduler.OneCycleLR,
-                    grad_clip: float) -> float:
+                    grad_clip: float, epoch: int,
+                    log_to_wandb: bool) -> tuple[float, float]:
     model.train()
     total_loss = 0.0
+    total_grad_norm = 0.0
     n_batches = 0
     use_amp = (device == "cuda")
     for surface, target_z in loader:
@@ -84,50 +90,71 @@ def train_one_epoch(model: nn.Module, loader: DataLoader,
 
         optim.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             pred_z = model(surface)
             loss = loss_fn(pred_z, target_z)
-        # loss.backward()
-        # optim.step()
+
         scaler.scale(loss).backward()
         scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         scaler.step(optim)
         scaler.update()
         scheduler.step()
 
-        total_loss += loss.item()
+        loss_val = loss.item()
+        gn_val = float(grad_norm)
+        total_loss += loss_val
+        total_grad_norm += gn_val
         n_batches += 1
-    return total_loss / max(n_batches, 1)
+
+        if log_to_wandb:
+            wandb.log({
+                "train/batch_loss": loss_val,
+                "train/grad_norm": gn_val,
+                "train/lr": scheduler.get_last_lr()[0],
+                "epoch": epoch,
+            })
+
+    return total_loss / max(n_batches, 1), total_grad_norm / max(n_batches, 1)
 
 @torch.no_grad()
 def validate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module,
-             device: str, normalizer: ParamNormalizer) -> tuple[float, np.ndarray]:
+             device: str, normalizer: ParamNormalizer
+             ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (mean_loss, per_param_rmse_raw, per_param_rel_median, per_param_rel_p95)."""
     model.eval()
     total_loss = 0.0
     n_batches = 0
-    sq_err_sum = torch.zeros(5, device = device)
-    n_seen = 0
     use_amp = (device == "cuda")
+    preds_z_all: list[torch.Tensor] = []
+    targets_z_all: list[torch.Tensor] = []
     for surface, target_z in loader:
         surface = surface.to(device, non_blocking=True)
         target_z = target_z.to(device, non_blocking=True)
-        
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             pred_z = model(surface)
             loss = loss_fn(pred_z, target_z)
 
         total_loss += loss.item()
         n_batches += 1
-
-        sq_err_sum += ((pred_z - target_z) ** 2).sum(dim=0).float()
-        n_seen += target_z.shape[0]
+        preds_z_all.append(pred_z.float().cpu())
+        targets_z_all.append(target_z.float().cpu())
 
     mean_loss = total_loss / max(n_batches, 1)
-    mse_z = (sq_err_sum / max(n_seen, 1)).cpu().numpy()
-    rmse_z = np.sqrt(mse_z)
-    rmse_raw = rmse_z * normalizer.std
-    return mean_loss, rmse_raw
+    preds_z = torch.cat(preds_z_all).numpy()
+    targets_z = torch.cat(targets_z_all).numpy()
+
+    # Decode to original units before computing per-param metrics — RMSE in z-space
+    # is uninformative because each param has a different scale.
+    preds_raw = normalizer.decode(preds_z)
+    targets_raw = normalizer.decode(targets_z)
+
+    rmse_raw = np.sqrt(((preds_raw - targets_raw) ** 2).mean(axis=0))
+    rel = np.abs(preds_raw - targets_raw) / np.maximum(np.abs(targets_raw), 1e-8)
+    rel_median = np.median(rel, axis=0)
+    rel_p95 = np.percentile(rel, 95, axis=0)
+    return mean_loss, rmse_raw, rel_median, rel_p95
 
 def save_checkpoint(path: str, model: nn.Module, model_name: str, cfg: dict,
                     normalizer: ParamNormalizer, epoch: int, val_loss: float) -> None:
@@ -151,10 +178,11 @@ def main() -> None:
         cfg = yaml.safe_load(f)
 
     epochs = args.epochs if args.epochs is not None else cfg["train"]["epochs"]
+    seed = args.seed if args.seed is not None else cfg["data"]["seed"]
 
-    setup_seeds(cfg["data"]["seed"])
+    setup_seeds(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device} | model: {args.model} epoch: {epochs}")
+    print(f"device: {device} | model: {args.model} | seed: {seed} | epochs: {epochs}")
 
     train_loader, val_loader, normalizer = make_loaders(cfg)
     print(f"train batches: {len(train_loader)} | val batches {len(val_loader)}")
@@ -178,61 +206,76 @@ def main() -> None:
     loss_fn = nn.MSELoss()
 
     use_amp = (device=="cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # bf16 has the same exponent range as fp32, so gradient scaling isn't
+    # needed (no underflow). Scaler kept in the call sites as a no-op for
+    # API compatibility with the fp16 path.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-# run_name = f"{args.model}-{time.strftime('%Y%m%d-%H%M%S')}"
-#           wandb.init( 
-#           project=cfg["wandb"]["project"],                                                                               
-#           entity=cfg["wandb"]["entity"],                                                                                 
-#           mode=args.wandb_mode,
-#           config=cfg,                                                                                                    
-#           name=run_name,                                                                                                 
+    run_name = f"{args.model}-seed{seed}-{time.strftime('%Y%m%d-%H%M%S')}"
+    wandb.init(
+        project=cfg["wandb"]["project"],
+        entity=cfg["wandb"]["entity"],
+        mode=args.wandb_mode,
+        config={**cfg, "model_arch": args.model, "n_params": n_params,
+                "seed": seed, "device": device, "epochs_planned": epochs},
+        name=run_name,
+    )
+    log_to_wandb = (args.wandb_mode != "disabled")
 
-#       )
     os.makedirs(args.out_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.out_dir, f"{args.model}_best.pt")
-    best_val = float("inf")                                                                                            
+    ckpt_path = os.path.join(args.out_dir, f"{args.model}_seed{seed}_best.pt")
+    best_val = float("inf")
     # Patience is used for stopping the training if validation loss does not improve, stopping early to prevent overfitting
     epochs_since_best = 0
     patience = cfg["train"]["early_stopping_patience"]
 
     grad_clip = cfg["train"]["grad_clip"]
-   
-    for epoch in range(epochs):                                                                                        
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optim, device, scaler, scheduler, grad_clip)
-        val_loss, rmse_raw = validate(model, val_loader, loss_fn, device, normalizer)                                  
-                                                                                                                     
-        log = { 
-          "epoch": epoch,                                                                                            
-          "train_loss": train_loss,
-          "val_loss": val_loss,
-          "lr": scheduler.get_last_lr()[0],
-        }                                                                                                              
-        for name, v in zip(PARAM_NAMES, rmse_raw):
-          log[f"rmse/{name}"] = float(v)                                                                             
-        # wandb.log(log)                                                                                                 
 
-        print(f"epoch {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f} "                                       
-            f"| lr {scheduler.get_last_lr()[0]:.2e} | rmse {format_rmse_line(rmse_raw)}")
-                                                                                                                     
+    for epoch in range(epochs):
+        t0 = time.time()
+        train_loss, mean_grad_norm = train_one_epoch(
+            model, train_loader, loss_fn, optim, device, scaler, scheduler,
+            grad_clip, epoch, log_to_wandb,
+        )
+        val_loss, rmse_raw, rel_median, rel_p95 = validate(
+            model, val_loader, loss_fn, device, normalizer,
+        )
+        epoch_time = time.time() - t0
+
+        log = {
+            "epoch": epoch,
+            "train/epoch_loss": train_loss,
+            "train/epoch_grad_norm": mean_grad_norm,
+            "train/epoch_time_s": epoch_time,
+            "val/loss": val_loss,
+            "val/lr_at_epoch_end": scheduler.get_last_lr()[0],
+        }
+        for name, r, m, p in zip(PARAM_NAMES, rmse_raw, rel_median, rel_p95):
+            log[f"val/rmse/{name}"] = float(r)
+            log[f"val/rel_median/{name}"] = float(m)
+            log[f"val/rel_p95/{name}"] = float(p)
+        if log_to_wandb:
+            wandb.log(log)
+
+        print(f"epoch {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f} "
+              f"| lr {scheduler.get_last_lr()[0]:.2e} | gn {mean_grad_norm:.2f} "
+              f"| {epoch_time:.1f}s | rmse {format_rmse_line(rmse_raw)}")
+
         if val_loss < best_val:
-          best_val = val_loss                                                                                        
-          epochs_since_best = 0
-          save_checkpoint(ckpt_path, model, args.model, cfg, normalizer, epoch, val_loss)
+            best_val = val_loss
+            epochs_since_best = 0
+            save_checkpoint(ckpt_path, model, args.model, cfg, normalizer, epoch, val_loss)
         else:
-            # we have not improved for another epoch
             epochs_since_best += 1
 
         if epochs_since_best >= patience:
             print(f"early stopping at epoch {epoch}")
             break
-                                                                                                                     
-    print(f"best val loss: {best_val:.4f} | checkpoint: {ckpt_path}")                                                  
 
-    # useful for the future
-    # state = torch.load(ckpt_path, map_location=device)
-    # model.load_state_dict(state["model_state"])
-  # wandb.finish()                                                                                                     
+    print(f"best val loss: {best_val:.4f} | checkpoint: {ckpt_path}")
+    if log_to_wandb:
+        wandb.summary["best_val_loss"] = best_val
+        wandb.finish()
                                                                                                                          
                   
 if __name__ == "__main__":
